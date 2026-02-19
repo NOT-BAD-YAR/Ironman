@@ -6,8 +6,10 @@ class YoloDetector:
     def __init__(self, model_path, conf_threshold=0.4):
         """
         Initialize YOLO detector with model weights.
+        Supports both PyTorch (.pt) and ONNX (.onnx) formats.
         """
-        self.model = YOLO(model_path)
+        # Specify task='detect' to avoid warning for ONNX models
+        self.model = YOLO(model_path, task='detect')
         self.conf_threshold = conf_threshold
         # Allowed classes from user description
         # Note: Need to verify class IDs for 'pothole' and 'garbage' in the custom model.

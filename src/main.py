@@ -12,6 +12,13 @@ from src.roi_utils import get_roi_crop, is_inside_roi
 from src.detectors.yolo_detector import YoloDetector
 from src.detectors.brightness_detector import BrightnessDetector
 
+# Try to import Pi Camera helper (optional)
+try:
+    from src.pi_camera_helper import create_camera_source
+    PI_CAMERA_AVAILABLE = True
+except ImportError:
+    PI_CAMERA_AVAILABLE = False
+
 import random
 import string
 import json
@@ -20,42 +27,175 @@ import datetime
 def main():
     # --- Configuration ---
     CAMERA_ID = "f47QoL9zBWtzs23FBjfo" # ID from user screenshot
-    VIDEO_SOURCE = r"O:\CivicHeroH\src\samples\test.mp4"
-    YOLO_MODEL_PATH = r"O:\CivicHeroH\ultra.pt"
+    
+    # Video source priority:
+    # 1. Use test video first (for testing)
+    # 2. Fallback to webcam if video not found
+    # 3. Future: Can use RTSP stream for CCTV camera
+    # Examples:
+    #   - Local file: "src/samples/test.mp4"
+    #   - Webcam: 0 (default camera)
+    #   - RTSP stream: "rtsp://username:password@ip:port/stream"
+    
+    # Primary: Use test video
+    VIDEO_SOURCE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "src", "samples", "test.mp4")
+    FALLBACK_WEBCAM = 0  # Webcam (fallback if video not found)
+    
+    # YOLO model path - Using ONNX for better performance
+    YOLO_MODEL_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "ultra.onnx")
     
     print(f"Starting CivicHeroH Edge for Camera: {CAMERA_ID}")
     
-    # 1. Load Configuration
-    camera_config = get_camera_config(CAMERA_ID)
-    if not camera_config:
-        print(f"Failed to load init config for {CAMERA_ID}. Exiting.")
-        return
+    # 1. Load Configuration (with timeout and fallback)
+    print("📡 Connecting to Firebase...")
+    camera_config = None
+    rois = []
     
-    rois = camera_config.get('rois', [])
-    print(f"Loaded {len(rois)} ROIs from Firestore.")
-    if len(rois) > 0:
-        print(f"First ROI type: {rois[0].get('type')}")
+    try:
+        # Try to get camera config (non-blocking with timeout)
+        import threading
+        
+        config_result = [None]
+        config_error = [None]
+        
+        def fetch_config():
+            try:
+                config_result[0] = get_camera_config(CAMERA_ID)
+            except Exception as e:
+                config_error[0] = e
+        
+        # Start config fetch in background thread
+        config_thread = threading.Thread(target=fetch_config, daemon=True)
+        config_thread.start()
+        config_thread.join(timeout=5)  # Wait max 5 seconds
+        
+        if config_thread.is_alive():
+            print("⚠️  Firebase connection timeout (>5s)")
+            print("⚠️  Continuing without Firebase - detection will still work")
+            camera_config = None
+        elif config_error[0]:
+            print(f"⚠️  Firebase connection error: {config_error[0]}")
+            print("⚠️  Continuing without Firebase - detection will still work")
+            camera_config = None
+        else:
+            camera_config = config_result[0]
+            
+    except Exception as e:
+        print(f"⚠️  Error loading camera config: {e}")
+        print("⚠️  Continuing without Firebase - detection will still work")
+        camera_config = None
+    
+    if camera_config:
+        rois = camera_config.get('rois', [])
+        print(f"✅ Loaded {len(rois)} ROIs from Firestore.")
+        if len(rois) > 0:
+            print(f"   First ROI type: {rois[0].get('type')}")
+    else:
+        print("⚠️  No camera config loaded - detection will work on entire frame")
+        print("   Note: All detections will be processed (no ROI filtering)")
+        rois = []
 
     # 2. Initialize Detectors
     try:
+        print(f"🤖 Loading ONNX model: {YOLO_MODEL_PATH}")
         yolo_detector = YoloDetector(YOLO_MODEL_PATH)
         brightness_detector = BrightnessDetector()
-        print("Detectors initialized.")
+        print("✅ Detectors initialized successfully")
     except Exception as e:
-        print(f"Error initializing detectors: {e}")
+        print(f"❌ Error initializing detectors: {e}")
+        import traceback
+        traceback.print_exc()
         return
 
-    # 3. Open Video Source
-    cap = cv2.VideoCapture(VIDEO_SOURCE)
-    if not cap.isOpened():
-        print(f"Error opening video source: {VIDEO_SOURCE}")
+    # 3. Open Video Source with fallback
+    cap = None
+    video_source_name = "Unknown"
+    
+    # Try test video first (for testing)
+    try:
+        print(f"📹 Attempting to open test video: {VIDEO_SOURCE}")
+        if os.path.exists(VIDEO_SOURCE):
+            cap = cv2.VideoCapture(VIDEO_SOURCE)
+            if cap.isOpened():
+                # Test if video actually works by reading a frame
+                ret, test_frame = cap.read()
+                if ret and test_frame is not None:
+                    video_source_name = "Test Video (test.mp4)"
+                    print(f"✅ Successfully opened {video_source_name}")
+                    # Reset to beginning
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                else:
+                    print(f"⚠️  Video opened but cannot read frames")
+                    cap.release()
+                    cap = None
+            else:
+                print(f"⚠️  Cannot open video file")
+                cap = None
+        else:
+            print(f"⚠️  Video file not found: {VIDEO_SOURCE}")
+            cap = None
+    except Exception as e:
+        print(f"⚠️  Error opening video: {e}")
+        if cap:
+            cap.release()
+        cap = None
+    
+    # Fallback to webcam if video fails
+    if cap is None or not cap.isOpened():
+        try:
+            print(f"📹 Falling back to webcam (index {FALLBACK_WEBCAM})...")
+            cap = cv2.VideoCapture(FALLBACK_WEBCAM)
+            
+            # Test if webcam actually works by reading a frame
+            if cap.isOpened():
+                ret, test_frame = cap.read()
+                if ret and test_frame is not None:
+                    video_source_name = f"Webcam (index {FALLBACK_WEBCAM})"
+                    print(f"✅ Successfully connected to {video_source_name}")
+                else:
+                    print(f"⚠️  Webcam opened but cannot read frames")
+                    cap.release()
+                    cap = None
+            else:
+                print(f"⚠️  Cannot open webcam")
+                cap = None
+        except Exception as e:
+            print(f"⚠️  Error opening webcam: {e}")
+            if cap:
+                cap.release()
+            cap = None
+    
+    if not cap or not cap.isOpened():
+        print("❌ Failed to open any video source. Exiting.")
+        return
+    
+    # Support for Raspberry Pi Camera Module (future use)
+    if PI_CAMERA_AVAILABLE and isinstance(VIDEO_SOURCE, str) and VIDEO_SOURCE.lower() in ["pi", "picamera", "raspberry"]:
+        try:
+            pi_cap = create_camera_source(VIDEO_SOURCE)
+            if pi_cap.isOpened():
+                if cap:
+                    cap.release()
+                cap = pi_cap
+                video_source_name = "Raspberry Pi Camera Module"
+                print(f"✅ Using {video_source_name}")
+        except Exception as e:
+            print(f"⚠️  Pi Camera not available: {e}")
+            # Continue with existing cap
+    
+    if not cap or not cap.isOpened():
+        print("❌ Failed to open any video source. Exiting.")
         return
         
-    # Get original FPS
+    # Get video properties
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    frame_delay = int(1000 / fps)
+    frame_delay = int(1000 / fps) if fps > 0 else 33  # Default 30fps if unknown
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
-    print(f"Video FPS: {fps:.2f}, Delay: {frame_delay}ms")
+    print(f"📹 Video Source: {video_source_name}")
+    print(f"📊 Resolution: {width}x{height} @ {fps:.2f} FPS")
+    print(f"⏱️  Frame delay: {frame_delay}ms")
 
     # Processing Loop
     frame_count = 0
@@ -97,6 +237,105 @@ def main():
         if frame_count % DETECTION_INTERVAL == 0:
             active_detections = [] # Clear previous detections
             
+            # Debug: Show detection status
+            if frame_count == DETECTION_INTERVAL:
+                print(f"🔍 Starting detection (ROIs: {len(rois)}, Interval: every {DETECTION_INTERVAL} frames)")
+            
+            # If no ROIs configured, process entire frame
+            if len(rois) == 0:
+                # Process entire frame without ROI filtering
+                try:
+                    detections = yolo_detector.detect(frame)
+                    print(f"🔍 Frame {frame_count}: Found {len(detections)} detections (no ROIs configured)")
+                    
+                    for det in detections:
+                        label = det['type']
+                        conf = det['confidence']
+                        bbox = det['bbox']
+                        
+                        print(f"   → {label}: {conf:.2f} confidence at {bbox}")
+                        
+                        # Store for drawing
+                        active_detections.append((bbox, label, conf))
+                        
+                        # Report if confidence is high enough
+                        if conf >= 0.5:  # Threshold for reporting without ROI
+                            # Check cooldown (use 'full_frame' as ROI ID)
+                            roi_id = 'full_frame'
+                            if roi_id in last_reported and (current_time - last_reported[roi_id] < REPORT_COOLDOWN):
+                                print(f"   ⏸️  Cooldown active, skipping report")
+                                continue
+                            
+                            # Report incident
+                            timestamp_str = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+                            random_suffix = ''.join(random.choices(string.digits, k=4))
+                            complain_id = f"CH{timestamp_str}{random_suffix}"
+                            
+                            image_filename = f"{complain_id}.jpg"
+                            temp_image_path = os.path.join(os.path.dirname(__file__), 'samples', 'temp_captures', image_filename)
+                            os.makedirs(os.path.dirname(temp_image_path), exist_ok=True)
+                            cv2.imwrite(temp_image_path, frame)  # Save full frame
+                            
+                            print(f"📤 Uploading image for {complain_id}...")
+                            remote_path = f"issues/{image_filename}"
+                            image_url = ""
+                            if camera_config:  # Only upload if Firebase connected
+                                image_url = upload_incident_image(temp_image_path, remote_path)
+                            
+                            if os.path.exists(temp_image_path):
+                                os.remove(temp_image_path)
+                            
+                            department_map = {'pothole': 'Road Department', 'garbage': 'Sanitation Department', 'streetlight': 'Electricity Department', 'water_leak': 'Water Department'}
+                            department = department_map.get(label, 'General Department')
+                            
+                            urgency = 'Low'
+                            if label == 'pothole': urgency = 'High' if conf > 0.8 else 'Medium'
+                            elif label == 'garbage': urgency = 'Medium'
+                            
+                            # Get location from camera config (with fallback)
+                            if camera_config:
+                                address = camera_config.get('locationName', camera_config.get('address', 'Unknown Location'))
+                                user_id = camera_config.get('user_id', 'unknown_user')
+                                lat = camera_config.get('latitude', 0.0)
+                                lng = camera_config.get('longitude', 0.0)
+                            else:
+                                address = 'Unknown Location (Firebase not connected)'
+                                user_id = 'unknown_user'
+                                lat = 0.0
+                                lng = 0.0
+                            
+                            reported_date = datetime.datetime.now().isoformat()
+                            
+                            incident_data = {
+                                "address": address, "complain_id": complain_id, "department": department,
+                                "description": f"Automated detection: {label} with {conf:.2f} confidence.",
+                                "image_url": image_url or "", "issue_type": label.capitalize(), 
+                                "latitude": lat, "longitude": lng, "reported_date": reported_date,
+                                "status": "Reported", "urgency": urgency, "user_id": user_id,
+                                "roi_id": roi_id, "camera_id": CAMERA_ID
+                            }
+                            
+                            # Always try to create incident (Firebase client handles connection check)
+                            try:
+                                create_incident(incident_data)
+                                print(f"✅ Incident created in Firebase: {complain_id}")
+                            except Exception as e:
+                                print(f"⚠️  Failed to create incident in Firebase: {e}")
+                                print(f"   Incident details: {complain_id} ({label}, {conf:.2f})")
+                            
+                            last_reported[roi_id] = time.time()
+                            try:
+                                with open(COOLDOWN_FILE, 'w') as f: json.dump(last_reported, f)
+                            except Exception as e: print(f"Error saving cooldowns: {e}")
+                            
+                            visual_feedback_text = f"DETECTED: {label} ({urgency})"
+                            visual_feedback_start = time.time()
+                except Exception as e:
+                    print(f"❌ Detection error: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # Process ROIs if configured
             for roi in rois:
                 roi_id = roi.get('id')
                 roi_type = roi.get('type')
@@ -171,7 +410,12 @@ def main():
                                 "roi_id": roi_id, "camera_id": CAMERA_ID
                             }
                             
-                            create_incident(incident_data)
+                            # Always try to create incident (Firebase client handles connection check)
+                            try:
+                                create_incident(incident_data)
+                                print(f"✅ Incident created in Firebase: {complain_id}")
+                            except Exception as e:
+                                print(f"⚠️  Failed to create incident in Firebase: {e}")
                             last_reported[roi_id] = time.time()
                             try:
                                 with open(COOLDOWN_FILE, 'w') as f: json.dump(last_reported, f)
@@ -210,15 +454,27 @@ def main():
                             
                             if os.path.exists(temp_image_path): os.remove(temp_image_path)
 
+                            # Get location from camera config (with fallback)
+                            if camera_config:
+                                address = camera_config.get('locationName', camera_config.get('address', 'Unknown Location'))
+                                user_id = camera_config.get('user_id', 'unknown_user')
+                                lat = camera_config.get('latitude', 0.0)
+                                lng = camera_config.get('longitude', 0.0)
+                            else:
+                                address = 'Unknown Location (Firebase not connected)'
+                                user_id = 'unknown_user'
+                                lat = 0.0
+                                lng = 0.0
+                            
                             incident_data = {
-                                "address": camera_config.get('locationName', camera_config.get('address', 'Unknown Location')),
+                                "address": address,
                                 "complain_id": complain_id, "department": 'Electricity Department',
                                 "description": "Streetlight appears to be off at night",
                                 "image_url": image_url or "", "issue_type": "Streetlight",
-                                "latitude": camera_config.get('latitude', 0.0), "longitude": camera_config.get('longitude', 0.0),
+                                "latitude": lat, "longitude": lng,
                                 "reported_date": datetime.datetime.now().isoformat(),
                                 "status": "Reported", "urgency": "Low",
-                                "user_id": camera_config.get('user_id', 'unknown_user'),
+                                "user_id": user_id,
                                 "roi_id": roi_id, "camera_id": CAMERA_ID
                             }
                             create_incident(incident_data)
@@ -238,12 +494,20 @@ def main():
             pixel_points = np.array([[int(p[0]*w), int(p[1]*h)] for p in points], np.int32)
             cv2.polylines(debug_frame, [pixel_points], True, (0, 255, 0), 2)
             cv2.putText(debug_frame, roi.get('id'), (pixel_points[0][0], pixel_points[0][1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-            
+        
         # Draw Active Detections (persisted from last detection frame)
         for det in active_detections:
             g_bbox, label, conf = det
             cv2.rectangle(debug_frame, (int(g_bbox[0]), int(g_bbox[1])), (int(g_bbox[2]), int(g_bbox[3])), (0, 0, 255), 2)
             cv2.putText(debug_frame, f"{label} {conf:.2f}", (int(g_bbox[0]), int(g_bbox[1])-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+        
+        # Show detection status on frame
+        status_text = f"Frame: {frame_count} | Detections: {len(active_detections)}"
+        if len(rois) == 0:
+            status_text += " | Mode: Full Frame (No ROIs)"
+        else:
+            status_text += f" | ROIs: {len(rois)}"
+        cv2.putText(debug_frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
         # Draw Feedback Overlay
         if current_time - visual_feedback_start < 3.0 and visual_feedback_text:
